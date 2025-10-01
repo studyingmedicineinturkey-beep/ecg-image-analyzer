@@ -46,23 +46,45 @@ def deskew_unwarp(img):
     M = cv.getRotationMatrix2D((w//2,h//2), angle, 1.0)
     return cv.warpAffine(img, M, (w,h), flags=cv.INTER_LINEAR, borderMode=cv.BORDER_REPLICATE)
 
-def estimate_grid_px(gray):
+def estimate_grid_px(gray: np.ndarray) -> int:
+    """
+    Estimate small-grid spacing (pixels per mm) from the ECG paper background.
+    Works with NumPy >= 2.0 (uses np.ptp instead of ndarray.ptp).
+    """
+    # FFT magnitude around DC
     f = np.fft.fftshift(np.fft.fft2(gray))
     mag = np.log1p(np.abs(f))
-    cy, cx = np.array(mag.shape)//2
-    row = mag[cy, :]
-    col = mag[:, cx]
-    def peak_period(v):
-        v = (v - v.min())/(v.ptp()+1e-6)
-        v[:10] = 0; v[-10:] = 0
-        peaks = np.argpartition(v, -5)[-5:]
+
+    cy, cx = np.array(mag.shape) // 2
+    row = mag[cy, :].astype(np.float64, copy=False)
+    col = mag[:, cx].astype(np.float64, copy=False)
+
+    def peak_period(v: np.ndarray) -> int:
+        # normalize [0,1] robustly
+        vmin = float(np.min(v))
+        rng  = float(np.ptp(v))  # NumPy 2.0-safe
+        if rng < 1e-9:
+            return 12
+        v = (v - vmin) / (rng + 1e-6)
+
+        # ignore DC edges
+        if v.size > 20:
+            v[:10] = 0
+            v[-10:] = 0
+
+        # pick several top peaks and look at spacing
+        k = min(5, max(2, v.size // 20))
+        peaks = np.argpartition(v, -k)[-k:]
         peaks = np.sort(peaks)
-        if len(peaks) >= 2:
+        if peaks.size >= 2:
             d = np.diff(peaks)
-            return int(np.median(d))
+            med = float(np.median(d))
+            return int(np.clip(med, 8, 20))
         return 12
+
     px = int(np.clip(np.mean([peak_period(row), peak_period(col)]), 8, 20))
-    return max(px, 8)
+    return px
+
 
 def remove_grid(gray, px_small):
     kh = cv.getStructuringElement(cv.MORPH_RECT, (max(1, px_small//2), 1))
