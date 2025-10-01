@@ -28,6 +28,14 @@ def pdf_first_page_to_bgr(pdf_bytes: bytes):
     img  = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, 3)
     return cv.cvtColor(img, cv.COLOR_RGB2BGR)
 
+# ---------- helpers: pre-enhance ----------
+def enhance(gray):
+    # Contrast + mild denoise to make traces stand out
+    clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    e = clahe.apply(gray)
+    e = cv.bilateralFilter(e, d=5, sigmaColor=50, sigmaSpace=5)
+    return e
+
 # ---------- helpers: grid + segmentation ----------
 def estimate_grid_px(gray: np.ndarray) -> int:
     """Estimate small-grid spacing (pixels per 1 mm). NumPy 2.0 safe."""
@@ -76,22 +84,35 @@ def segment_12lead(gray):
 def band_to_signal(band, px_small, fs=250):
     """Trace extraction via binarize -> skeleton -> per-column median -> resample."""
     band = cv.normalize(band, None, 0, 255, cv.NORM_MINMAX)
-    thr  = cv.adaptiveThreshold(band, 255, cv.ADAPTIVE_THRESH_MEAN_C,
+
+    # dual thresholding for robustness
+    thr1 = cv.adaptiveThreshold(band, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C,
                                 cv.THRESH_BINARY_INV, 31, 5)
-    thr  = cv.medianBlur(thr, 3)
+    blur = cv.GaussianBlur(band, (5,5), 0)
+    _, thr2 = cv.threshold(blur, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU)
+    thr = cv.max(thr1, thr2)
+
+    # connect gaps and thin noise
+    thr = cv.morphologyEx(thr, cv.MORPH_CLOSE, cv.getStructuringElement(cv.MORPH_RECT, (3,3)), iterations=1)
+    thr = cv.medianBlur(thr, 3)
+
+    # skeletonize to single-pixel trace
     skel = skeletonize((thr > 0).astype(np.uint8)).astype(np.uint8) * 255
 
     h, w = skel.shape
     ys = []
     for x in range(w):
         idx = np.where(skel[:, x] > 0)[0]
-        ys.append(np.median(idx) if len(idx) else np.nan)
+        ys.append(float(np.median(idx)) if idx.size else np.nan)
     ys = np.array(ys, dtype=float)
 
     # fill gaps
     if np.any(np.isnan(ys)):
         nans = np.isnan(ys)
-        ys[nans] = np.interp(np.flatnonzero(nans), np.flatnonzero(~nans), ys[~nans])
+        if np.any(~nans):
+            ys[nans] = np.interp(np.flatnonzero(nans), np.flatnonzero(~nans), ys[~nans])
+        else:
+            ys[:] = 0.0  # no trace at all; flat fallback
 
     # pixels -> mV (10 mm/mV) and sec (25 mm/s)
     px_per_mm = float(px_small)
@@ -101,8 +122,7 @@ def band_to_signal(band, px_small, fs=250):
 
     s_per_px = 1.0 / (25.0 * px_per_mm)
     t = np.arange(len(sig_mv)) * s_per_px
-    target = int(t[-1] * fs) if len(t) > 1 else len(sig_mv)
-    if target <= 0: target = len(sig_mv)
+    target = max(1, int(t[-1] * fs)) if len(t) > 1 else len(sig_mv)
     resampled = np.interp(np.linspace(0, len(sig_mv) - 1, target),
                           np.arange(len(sig_mv)), sig_mv)
     return resampled, fs
@@ -113,13 +133,12 @@ def signal_quality(sig, fs):
     try:
         _, info = nk.ecg_peaks(sig, sampling_rate=fs)
         r = info.get("ECG_R_Peaks", np.array([]))
-        if r.size < 3:
+        if getattr(r, "size", 0) < 3:
             return 0.0
         rr = np.diff(r) / fs
         if rr.size < 2:
             return 0.0
         hr = 60.0 / np.median(rr)
-        # penalize high RR variance and implausible HR
         jitter = float(np.std(rr) / (np.median(rr)+1e-9))
         score = 1.0 / (1.0 + 3.0*jitter)
         if hr < 25 or hr > 200:
@@ -130,77 +149,85 @@ def signal_quality(sig, fs):
 
 def choose_best_band(bands, px_small, fs=250):
     """Extract signals for several bands and pick the best-quality one."""
-    best = {"score": -1, "idx": 0, "sig": None}
-    test_indices = list(range(min(6, len(bands))))  # try first 6 bands quickly
-    for i in test_indices:
+    best = {"score": -1.0, "idx": 0, "sig": None}
+    for i in range(min(12, len(bands))):
         try:
             sig, _ = band_to_signal(bands[i], px_small, fs=fs)
-            q = signal_quality(sig, fs)
-            if q > best["score"]:
-                best = {"score": q, "idx": i, "sig": sig}
+            var = float(np.var(sig))
+            q   = signal_quality(sig, fs)
+            score = 0.6*q + 0.4*(np.tanh(var*5))
+            if score > best["score"]:
+                best = {"score": score, "idx": i, "sig": sig}
         except Exception:
             continue
-    # fallback
     if best["sig"] is None and len(bands):
         best["idx"] = 0
         best["sig"], _ = band_to_signal(bands[0], px_small, fs=fs)
         best["score"] = signal_quality(best["sig"], fs)
     return best["idx"], best["sig"], best["score"]
 
-def measured_facts(sig, fs):
-    """Compute HR, PR, QRS, QT, QTc using NeuroKit2 delineation."""
-    # clean & peaks
-    clean = nk.ecg_clean(sig, sampling_rate=fs, method="neurokit")
-    _, peaks = nk.ecg_peaks(clean, sampling_rate=fs)
-    rpeaks = peaks.get("ECG_R_Peaks", np.array([]))
+def _hr_autocorr(sig, fs):
+    x = sig - np.mean(sig)
+    ac = np.correlate(x, x, mode='full')[len(x)-1:]
+    lag_min = int(0.3 * fs)
+    lag_max = int(2.5 * fs)
+    if lag_max <= lag_min or lag_max >= len(ac):
+        return 75.0
+    idx = lag_min + np.argmax(ac[lag_min:lag_max])
+    rr = idx / fs
+    return float(np.clip(60.0 / rr, 20, 220))
 
-    # HR from RR
-    hr = 75
-    if rpeaks.size >= 2:
+def measured_facts(sig, fs):
+    # try two cleaners, keep the one with more peaks
+    clean1 = nk.ecg_clean(sig, sampling_rate=fs, method="neurokit")
+    clean2 = nk.ecg_clean(sig, sampling_rate=fs, method="biosppy")
+    peaks1 = nk.ecg_peaks(clean1, sampling_rate=fs)[1].get("ECG_R_Peaks", np.array([]))
+    peaks2 = nk.ecg_peaks(clean2, sampling_rate=fs)[1].get("ECG_R_Peaks", np.array([]))
+    cand = [(clean1, peaks1), (clean2, peaks2)]
+    best = max(cand, key=lambda cp: getattr(cp[1], "size", len(cp[1])))
+    clean, rpeaks = best
+
+    # HR (fallback to autocorr if peaks weak)
+    if getattr(rpeaks, "size", 0) >= 2:
         rr = np.diff(rpeaks) / fs
         hr = float(np.clip(60.0 / np.median(rr), 20, 220))
+    else:
+        hr = _hr_autocorr(clean, fs)
 
-    # delineation (P/QRS/T boundaries)
     pr_ms = qrs_ms = qt_ms = qtc_bazett = qtc_frid = None
-    try:
-        sigs, waves = nk.ecg_delineate(clean, rpeaks=rpeaks, sampling_rate=fs, method="dwt")
-        # Expected keys (NeuroKit2): 'ECG_P_Onsets','ECG_P_Offsets','ECG_R_Onsets','ECG_R_Offsets','ECG_T_Offsets'
-        Pon  = np.array(waves.get("ECG_P_Onsets", []), dtype=int)
-        Poff = np.array(waves.get("ECG_P_Offsets", []), dtype=int)
-        Ron  = np.array(waves.get("ECG_R_Onsets", []), dtype=int)   # QRS onset
-        Roff = np.array(waves.get("ECG_R_Offsets", []), dtype=int) # QRS offset
-        Toff = np.array(waves.get("ECG_T_Offsets", []), dtype=int)
 
-        def med_ms(a, b):
-            x = []
-            for aa, bb in zip(a, b):
-                if not np.isnan(aa) and not np.isnan(bb) and bb > aa:
-                    x.append((bb - aa) * 1000.0 / fs)
-            return float(np.median(x)) if len(x) else None
+    # 2 delineation attempts
+    for method in ("dwt", "peak"):
+        try:
+            _, waves = nk.ecg_delineate(clean, rpeaks=rpeaks, sampling_rate=fs, method=method)
+            Pon  = np.array(waves.get("ECG_P_Onsets", []), dtype=float)
+            Ron  = np.array(waves.get("ECG_R_Onsets", []), dtype=float)
+            Roff = np.array(waves.get("ECG_R_Offsets", []), dtype=float)
+            Toff = np.array(waves.get("ECG_T_Offsets", []), dtype=float)
 
-        # PR: P onset to QRS onset
-        if Pon.size and Ron.size:
-            pr_ms = med_ms(Pon, Ron)
+            def med_ms(a, b):
+                vals = []
+                for aa, bb in zip(a, b):
+                    if not np.isnan(aa) and not np.isnan(bb) and bb > aa:
+                        vals.append((bb - aa) * 1000.0 / fs)
+                return float(np.median(vals)) if len(vals) else None
 
-        # QRS: QRS onset to offset
-        if Ron.size and Roff.size:
-            qrs_ms = med_ms(Ron, Roff)
+            if pr_ms is None and Pon.size and Ron.size:
+                pr_ms = med_ms(Pon, Ron)
+            if qrs_ms is None and Ron.size and Roff.size:
+                qrs_ms = med_ms(Ron, Roff)
+            if qt_ms is None and Ron.size and Toff.size:
+                qt_ms = med_ms(Ron, Toff)
 
-        # QT: QRS onset to T offset
-        if Ron.size and Toff.size:
-            qt_ms = med_ms(Ron, Toff)
+            if qt_ms and getattr(rpeaks, "size", 0) >= 2:
+                rr = np.diff(rpeaks) / fs
+                rr_s = float(np.median(rr))
+                qt_s = qt_ms / 1000.0
+                qtc_bazett  = 1000.0 * (qt_s / np.sqrt(rr_s))
+                qtc_frid    = 1000.0 * (qt_s / np.cbrt(rr_s))
+        except Exception:
+            continue
 
-        # QTc (Bazett & Fridericia) from QT and RR
-        if qt_ms and rpeaks.size >= 2:
-            rr = np.diff(rpeaks) / fs
-            rr_s = float(np.median(rr))
-            qt_s = qt_ms / 1000.0
-            qtc_bazett  = 1000.0 * (qt_s / np.sqrt(rr_s))
-            qtc_frid    = 1000.0 * (qt_s / np.cbrt(rr_s))
-    except Exception:
-        pass
-
-    # Build the facts object (include None for unavailable metrics; all numbers are measured)
     facts = {
         "measurements": {
             "hr": int(round(hr)),
@@ -213,14 +240,14 @@ def measured_facts(sig, fs):
         "quality": {}
     }
 
-    # simple AF likelihood proxy (irregularity of RR) — illustrative only
-    if rpeaks.size >= 5:
+    # simple AF-like proxy & quality score
+    if getattr(rpeaks, "size", 0) >= 5:
         rr = np.diff(rpeaks) / fs
         af_prob = float(np.clip(np.std(rr) * 4.0, 0, 1))
     else:
         af_prob = 0.2
     facts["labels"] = [{"code": "AF_like_irregularity", "prob": round(af_prob, 2)}]
-    facts["quality"]["signal_quality_0to1"] = signal_quality(sig, fs)
+    facts["quality"]["signal_quality_0to1"] = signal_quality(clean, fs)
 
     return facts
 
@@ -245,6 +272,7 @@ async def analyze_image(file: UploadFile = File(...)):
             return JSONResponse({"error": "Not an image/PDF"}, status_code=400)
 
         gray  = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
+        gray  = enhance(gray)
         px    = estimate_grid_px(gray)
         clean = remove_grid(gray, px)
         bands = segment_12lead(clean)
@@ -260,7 +288,7 @@ async def analyze_image(file: UploadFile = File(...)):
             "grid_px_per_mm": px,
             "lead_index_used": int(lead_idx),
             "quality_score_0to1": float(qscore),
-            "pipeline": "image->signal skeletonization; nk.ecg_clean/peaks/delineate(dwt)"
+            "pipeline": "enhance->grid_est->grid_remove->segment->skeleton->nk(clean/peaks/delineate)"
         }
 
         return JSONResponse({"facts": facts})
