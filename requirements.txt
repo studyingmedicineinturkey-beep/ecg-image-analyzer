@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+numpy
+opencv-python-headless
+scikit-image
+neurokit2
+python-multipart
