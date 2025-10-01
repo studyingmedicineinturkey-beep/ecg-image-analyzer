@@ -4,3 +4,7 @@ numpy
 opencv-python-headless
 python-multipart
 pymupdf
+scikit-image
+neurokit2
+scipy
+pandas
