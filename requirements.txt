@@ -8,3 +8,4 @@ scikit-image
 neurokit2
 scipy
 pandas
+wfdb
